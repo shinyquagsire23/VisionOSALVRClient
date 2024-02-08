@@ -342,7 +342,8 @@ class Renderer {
             var alvrEvent = AlvrEvent()
             let res = alvr_poll_event(&alvrEvent)
             if !res {
-                usleep(1000)
+                //usleep(1000)
+                sched_yield()
                 continue
             }
             switch UInt32(alvrEvent.tag) {
@@ -384,6 +385,14 @@ class Renderer {
                         break
                     }
                     
+                    // If we get a ton of NALs from previous timestamps, but we've already sent off the current frame, just trash them.
+                    objc_sync_enter(frameQueueLock)
+                    if frameQueueLastTimestamp > timestamp {
+                        objc_sync_exit(frameQueueLock)
+                        continue
+                    }
+                    objc_sync_exit(frameQueueLock)
+                    
                     if let vtDecompressionSession = vtDecompressionSession {
                         VideoHandler.feedVideoIntoDecoder(decompressionSession: vtDecompressionSession, nals: nal, timestamp: timestamp, videoFormat: videoFormat!) { [self] imageBuffer in
                             alvr_report_frame_decoded(timestamp)
@@ -394,7 +403,13 @@ class Renderer {
                             //let imageBufferPtr = Unmanaged.passUnretained(imageBuffer).toOpaque()
                             //print("finish decode: \(timestamp), \(imageBufferPtr), \(nal_type)")
                             
+                            
+                            
                             objc_sync_enter(frameQueueLock)
+                            if frameQueueLastTimestamp > timestamp {
+                                objc_sync_exit(frameQueueLock)
+                                return
+                            }
                             if frameQueueLastTimestamp != timestamp
                             {
                                 // TODO: For some reason, really low frame rates seem to decode the wrong image for a split second?
