@@ -337,7 +337,68 @@ class Renderer {
         }
     }
     
+    func decodeNalBlob(collatedNals: NSMutableData, timestamp: UInt64)
+    {
+        if let vtDecompressionSession = vtDecompressionSession {
+            //print("send decode: \(timestamp)", collatedNals.count)
+            VideoHandler.feedVideoIntoDecoder(decompressionSession: vtDecompressionSession, nals: collatedNals as Data, timestamp: timestamp, videoFormat: videoFormat!) { [self] imageBuffer in
+                alvr_report_frame_decoded(timestamp)
+                guard let imageBuffer = imageBuffer else {
+                    print("finished decode, but nil buffer")
+                    return
+                }
+                
+                //let imageBufferPtr = Unmanaged.passUnretained(imageBuffer).toOpaque()
+                //print("finished decode: \(timestamp), \(imageBufferPtr)")
+                
+                objc_sync_enter(frameQueueLock)
+                if frameQueueLastTimestamp > timestamp {
+                    objc_sync_exit(frameQueueLock)
+                    return
+                }
+                if frameQueueLastTimestamp != timestamp
+                {
+                    // TODO: For some reason, really low frame rates seem to decode the wrong image for a split second?
+                    // But for whatever reason this is fine at high FPS.
+                    // From what I've read online, the only way to know if an H264 frame has actually completed is if
+                    // the next frame is starting, so keep this around for now just in case.
+                    if frameQueueLastImageBuffer != nil {
+                        //frameQueue.append(QueuedFrame(imageBuffer: frameQueueLastImageBuffer!, timestamp: frameQueueLastTimestamp))
+                        frameQueue.append(QueuedFrame(imageBuffer: imageBuffer, timestamp: timestamp))
+                    }
+                    else {
+                        frameQueue.append(QueuedFrame(imageBuffer: imageBuffer, timestamp: timestamp))
+                    }
+                    if frameQueue.count > 2 {
+                        frameQueue.removeFirst()
+                    }
+                    
+                    //print("queue: \(frameQueueLastTimestamp) -> \(timestamp), \(test)")
+                    
+                    frameQueueLastTimestamp = timestamp
+                    frameQueueLastImageBuffer = imageBuffer
+                }
+                
+                // Pull the very last imageBuffer for a given timestamp
+                if frameQueueLastTimestamp == timestamp {
+                     frameQueueLastImageBuffer = imageBuffer
+                }
+                
+                objc_sync_exit(frameQueueLock)
+            }
+        } else {
+            alvr_report_frame_decoded(timestamp)
+            alvr_report_compositor_start(timestamp)
+            alvr_report_submit(timestamp, 0)
+            
+            alvr_request_idr()
+        }
+    }
+    
     func handleAlvrEvents() {
+        var collatedNals = NSMutableData() // TODO: is there a better class for append/clear only?
+        var collatedNalsTimestamp: UInt64 = 0
+        
         while inputRunning {
             var alvrEvent = AlvrEvent()
             let res = alvr_poll_event(&alvrEvent)
@@ -384,7 +445,7 @@ class Renderer {
                     guard let (nal, timestamp) = VideoHandler.pollNal() else {
                         break
                     }
-                    
+
                     // If we get a ton of NALs from previous timestamps, but we've already sent off the current frame, just trash them.
                     objc_sync_enter(frameQueueLock)
                     if frameQueueLastTimestamp > timestamp {
@@ -393,61 +454,21 @@ class Renderer {
                     }
                     objc_sync_exit(frameQueueLock)
                     
-                    if let vtDecompressionSession = vtDecompressionSession {
-                        VideoHandler.feedVideoIntoDecoder(decompressionSession: vtDecompressionSession, nals: nal, timestamp: timestamp, videoFormat: videoFormat!) { [self] imageBuffer in
-                            alvr_report_frame_decoded(timestamp)
-                            guard let imageBuffer = imageBuffer else {
-                                return
-                            }
-                            
-                            //let imageBufferPtr = Unmanaged.passUnretained(imageBuffer).toOpaque()
-                            //print("finish decode: \(timestamp), \(imageBufferPtr), \(nal_type)")
-                            
-                            
-                            
-                            objc_sync_enter(frameQueueLock)
-                            if frameQueueLastTimestamp > timestamp {
-                                objc_sync_exit(frameQueueLock)
-                                return
-                            }
-                            if frameQueueLastTimestamp != timestamp
-                            {
-                                // TODO: For some reason, really low frame rates seem to decode the wrong image for a split second?
-                                // But for whatever reason this is fine at high FPS.
-                                // From what I've read online, the only way to know if an H264 frame has actually completed is if
-                                // the next frame is starting, so keep this around for now just in case.
-                                if frameQueueLastImageBuffer != nil {
-                                    //frameQueue.append(QueuedFrame(imageBuffer: frameQueueLastImageBuffer!, timestamp: frameQueueLastTimestamp))
-                                    frameQueue.append(QueuedFrame(imageBuffer: imageBuffer, timestamp: timestamp))
-                                }
-                                else {
-                                    frameQueue.append(QueuedFrame(imageBuffer: imageBuffer, timestamp: timestamp))
-                                }
-                                if frameQueue.count > 2 {
-                                    frameQueue.removeFirst()
-                                }
-                                
-                                //print("queue: \(frameQueueLastTimestamp) -> \(timestamp), \(test)")
-                                
-                                frameQueueLastTimestamp = timestamp
-                                frameQueueLastImageBuffer = imageBuffer
-                            }
-                            
-                            // Pull the very last imageBuffer for a given timestamp
-                            if frameQueueLastTimestamp == timestamp {
-                                 frameQueueLastImageBuffer = imageBuffer
-                            }
-                            
-                            objc_sync_exit(frameQueueLock)
-                        }
-                    } else {
-                        alvr_report_frame_decoded(timestamp)
-                        alvr_report_compositor_start(timestamp)
-                        alvr_report_submit(timestamp, 0)
+                    if collatedNalsTimestamp != timestamp && collatedNals.count > 0 {
+                        decodeNalBlob(collatedNals: collatedNals, timestamp: collatedNalsTimestamp)
+                        collatedNals = NSMutableData()
                     }
+
+                    //let nal_type = nal[4] & 0x1F
+                    //print("collect decode: \(timestamp), \(nal_type)")
+                    collatedNals.append(nal)
+                    collatedNalsTimestamp = timestamp
                 }
                 
-                
+                decodeNalBlob(collatedNals: collatedNals, timestamp: collatedNalsTimestamp)
+                collatedNals = NSMutableData()
+                collatedNalsTimestamp = 0
+                        
             default:
                 print("msg")
             }
@@ -563,6 +584,7 @@ class Renderer {
             let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: time)
             drawable.deviceAnchor = deviceAnchor
             
+            //let deviceAnchorLoc = lookupDeviceAnchorFor(timestamp: queuedFrame!.timestamp)
             //print("found anchor for frame!", deviceAnchorLoc, queuedFrame!.timestamp, deviceAnchor?.originFromAnchorTransform)
         }
         if drawable.deviceAnchor == nil {
