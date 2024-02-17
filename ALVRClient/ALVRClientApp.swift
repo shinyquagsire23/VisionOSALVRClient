@@ -5,6 +5,7 @@
 import SwiftUI
 #if os(visionOS)
 import CompositorServices
+import RealityKitContent
 #endif
 
 #if os(visionOS)
@@ -27,19 +28,47 @@ struct ContentStageConfiguration: CompositorLayerConfiguration {
 #if os(visionOS)
 @main
 struct MetalRendererApp: App {
+    @State private var model = ViewModel()
     var body: some Scene {
-#if false
-        WindowGroup {
-            ContentView()
-        }.windowStyle(.volumetric)
+#if true
+        //Entry point, this is the default window chosen in Info.plist from UIApplicationPreferredDefaultSceneSessionRole 
+        WindowGroup(id: Module.entry.name) {
+            Entry()
+                .environment(model)
+                .environmentObject(EventHandler.shared)
+                .onAppear {
+                    let group = DispatchGroup()
+
+                    group.enter()
+                    DispatchQueue.global(qos: .background).async {
+                        EventHandler.shared.initializeAlvr()
+                        Task {
+                            await WorldTracker.shared.initializeAr()
+                        }
+                        group.leave()
+                    }
+                
+                    group.notify(queue: .main) {
+                        EventHandler.shared.start()
+                    }
+                }
+        }
+        .windowStyle(.volumetric)
+        .defaultSize(width: 0.6, height: 0.6, depth: 0.6, in: .meters)
 #endif
-        ImmersiveSpace {
+        ImmersiveSpace(id: Module.client.name) {
             CompositorLayer(configuration: ContentStageConfiguration()) { layerRenderer in
                 let renderer = Renderer(layerRenderer)
                 renderer.startRenderLoop()
             }
         }
         //.upperLimbVisibility(.hidden) // TODO: make this an option
+    }
+    
+    init() {
+        //Register all the custom components and systems that the app uses.
+        RotationComponent.registerComponent()
+        RotationSystem.registerSystem()
     }
 }
 #endif
