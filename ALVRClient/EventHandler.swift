@@ -8,11 +8,17 @@ import Foundation
 import Metal
 import VideoToolbox
 import Combine
+import AVFoundation
+import CoreImage
+import CoreImage.CIFilterBuiltins
+import Vision
+import RealityKit
 
-class EventHandler: ObservableObject {
+class EventHandler: NSObject, ObservableObject {
     static let shared = EventHandler()
 
     var eventsThread : Thread?
+    
         
     var alvrInitialized = false
     var streamingActive = false
@@ -44,8 +50,17 @@ class EventHandler: ObservableObject {
     
     var framesRendered:Int = 0
     
+    // Camera stuff
+    var faceTrackingThread : Thread?
+    private let captureSession = AVCaptureSession()
+    private let context = CIContext()
+    var camPermissionGranted = false
+    @Published var frame: CGImage?
+    @Published var texture: MaterialParameters.Texture?
+    @Published var opacityTexture: MaterialParameters.Texture?
     
-    init() {}
+    
+    //init() {}
     
     func initializeAlvr() {
         if !alvrInitialized {
@@ -66,6 +81,12 @@ class EventHandler: ObservableObject {
             }
             eventsThread?.name = "Events Thread"
             eventsThread?.start()
+            
+            faceTrackingThread = Thread {
+                self.handleFaceTracking()
+            }
+            faceTrackingThread?.name = "Events Thread"
+            faceTrackingThread?.start()
         }
     }
     
@@ -269,7 +290,92 @@ class EventHandler: ObservableObject {
             self.IP = newIP
         }
     }
+    
+    func requestCamPermission() {
+        // Strong reference not a problem here but might become one in the future.
+        AVCaptureDevice.requestAccess(for: .video) { [unowned self] granted in
+            self.camPermissionGranted = granted
+        }
+    }
+    
+    func handleFaceTracking() {
+        // Ask for permission
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+            case .authorized: // The user has previously granted access to the camera.
+                self.camPermissionGranted = true
+                
+            case .notDetermined: // The user has not yet been asked for camera access.
+                self.requestCamPermission()
+                
+        // Combine the two other cases into the default case
+        default:
+            self.camPermissionGranted = false
+        }
+        
+        let videoOutput = AVCaptureVideoDataOutput()
+        
+        guard camPermissionGranted else {
+            print("Failed to get camera permission.")
+            return
+        }
+        print("We have the camera!")
+        
+        
+            
+        while inputRunning {
+            usleep(1000*1000)
+            /*if !EventHandler.shared.renderStarted {
+                continue
+            }*/
+            if !captureSession.isRunning {
+                do {
+                    let input = try AVCaptureDeviceInput(device: AVCaptureDevice.systemPreferredCamera!)
+                    
+                    if captureSession.inputs.count < 1 {
+                        captureSession.addInput(input)
+                    }
+                    videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "sampleBufferQueue"))
+                    if captureSession.outputs.count < 1 {
+                        captureSession.addOutput(videoOutput)
+                    }
+                    captureSession.startRunning()
+                } catch {
+                    print(error)
+                }
+            }
+            print(captureSession.isRunning, captureSession.inputs.count, captureSession.outputs.count)
+        }
+    }
 
+}
+
+extension EventHandler: AVCaptureVideoDataOutputSampleBufferDelegate {
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        var result = imageFromSampleBuffer(sampleBuffer: sampleBuffer)
+        guard var ciImage = result else { return }
+        
+        var cgImage = context.createCGImage(ciImage, from: ciImage.extent)!
+        
+        do {
+            let texture = try MaterialParameters.Texture.init(TextureResource.generate(from: cgImage, options: .init(semantic: .raw)))
+            DispatchQueue.main.async { [unowned self] in
+                self.texture = texture
+            }
+        } catch {
+            print("error")
+        }
+        
+        DispatchQueue.main.async { [unowned self] in
+            self.frame = cgImage
+        }
+    }
+    
+    private func imageFromSampleBuffer(sampleBuffer: CMSampleBuffer) -> CIImage? {
+        guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
+        let ciImage = CIImage(cvPixelBuffer: imageBuffer)
+        return ciImage
+    }
+    
 }
 
 enum ConnectionState {
