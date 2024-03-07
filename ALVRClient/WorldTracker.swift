@@ -5,6 +5,7 @@
 import Foundation
 import ARKit
 import CompositorServices
+import Spatial
 
 class WorldTracker {
     static let shared = WorldTracker()
@@ -81,6 +82,13 @@ class WorldTracker {
     static let rightHandOrientationCorrection = simd_quatf(from: simd_float3(0.0, 0.0, 1.0), to: simd_float3(0.0, 0.0, -1.0)) * simd_quatf(from: simd_float3(1.0, 0.0, 0.0), to: simd_float3(0.0, 0.0, 1.0))
     static let leftForearmOrientationCorrection = simd_quatf(from: simd_float3(1.0, 0.0, 0.0), to: simd_float3(0.0, 0.0, 1.0)) * simd_quatf(from: simd_float3(0.0, 1.0, 0.0), to: simd_float3(0.0, 0.0, 1.0))
     static let rightForearmOrientationCorrection = simd_quatf(from: simd_float3(1.0, 0.0, 0.0), to: simd_float3(0.0, 0.0, 1.0)) * simd_quatf(from: simd_float3(0.0, 1.0, 0.0), to: simd_float3(0.0, 0.0, 1.0))
+    //static let leftWristOrientationCorrectionA = simd_quatf(from: simd_float3(1.0, 0.0, 0.0), to: simd_float3(0.0, 0.0, 1.0)) //* simd_quatf(from: simd_float3(0.0, 1.0, 0.0), to: simd_float3(0.0, 0.0, 1.0))
+    //static let rightWristOrientationCorrectionA = simd_quatf(from: simd_float3(1.0, 0.0, 0.0), to: simd_float3(0.0, 0.0, 1.0)) //* simd_quatf(from: simd_float3(0.0, 1.0, 0.0), to: simd_float3(0.0, 0.0, 1.0))
+    static let leftWristOrientationCorrectionA = simd_quatf(from: simd_float3(0.0, 1.0, 0.0), to: simd_float3(0.0, 0.0, -1.0))// * simd_quatf(from: simd_float3(0.0, 0.0, 1.0), to: simd_float3(0.0, 0.0, -1.0))
+    static let rightWristOrientationCorrectionA = simd_quatf(from: simd_float3(0.0, 1.0, 0.0), to: simd_float3(0.0, 0.0, -1.0))// * simd_quatf(from: simd_float3(0.0, 0.0, 1.0), to: simd_float3(0.0, 0.0, -1.0))
+    
+    static let leftWristOrientationCorrectionB = simd_quatf(from: simd_float3(0.0, 0.0, 1.0), to: simd_float3(0.0, 0.0, -1.0))
+    static let rightWristOrientationCorrectionB = simd_quatf(from: simd_float3(0.0, 0.0, 1.0), to: simd_float3(0.0, 0.0, -1.0))
     
     init(arSession: ARKitSession = ARKitSession(), worldTracking: WorldTrackingProvider = WorldTrackingProvider(), handTracking: HandTrackingProvider = HandTrackingProvider(), sceneReconstruction: SceneReconstructionProvider = SceneReconstructionProvider(), planeDetection: PlaneDetectionProvider = PlaneDetectionProvider(alignments: [.horizontal, .vertical])) {
         self.arSession = arSession
@@ -365,6 +373,23 @@ class WorldTracker {
             let transformRaw = self.worldTrackingSteamVRTransform.inverse * hand.originFromAnchorTransform * joint.anchorFromJointTransform
             let transform = transformRaw
             var orientation = simd_quaternion(transform) * simd_quatf(from: simd_float3(1.0, 0.0, 0.0), to: simd_float3(0.0, 0.0, 1.0))
+            
+            // HACK: Apple's elbows currently have the same orientation as their wrists, which VRChat's IK really doesn't like.
+            // Ideally, the elbows would be some lerp based on the wrists, where the mapping goes from the wrist rotation 0-270deg
+            // to the elbow mapping 0-90deg.
+            if steamVrIdx == 27 {
+                let elbowRot = Rotation3D(orientation)
+                var twistAxis = simd_float3(ret[26].position.0, ret[26].position.1, ret[26].position.2) - simd_float3(transform.columns.3.x, transform.columns.3.y, transform.columns.3.z) //transform.columns.0
+                twistAxis = simd_normalize(twistAxis)
+                let twistAxisRot = simd_float3(twistAxis.x, twistAxis.y, twistAxis.z)
+                let (swing, twist) = elbowRot.swingTwist(twistAxis: RotationAxis3D(simd_float3(twistAxisRot.x, twistAxisRot.y, twistAxisRot.z)))
+                let swingQuat = swing.quaternion
+                let swingQuatf = simd_quatf(ix: Float(swingQuat.vector.x), iy: Float(swingQuat.vector.y), iz: Float(swingQuat.vector.z), r: Float(swingQuat.vector.w))
+                let twistQuat = twist.quaternion
+                let twistQuatf = simd_quatf(ix: Float(twistQuat.vector.x), iy: Float(twistQuat.vector.y), iz: Float(twistQuat.vector.z), r: Float(twistQuat.vector.w))
+                orientation = swingQuatf * (simd_slerp(simd_quatf(ix: 0.0, iy: 0.0, iz: 0.0, r: 1.0), twistQuatf, 1.0/3.0)) //simd_quatf(ix: 0.0, iy: 0.0, iz: 0.0, r: 1.0)
+            }
+            
             if hand.chirality == .right {
                 orientation = orientation * simd_quatf(from: simd_float3(0.0, 0.0, 1.0), to: simd_float3(0.0, 0.0, -1.0))
             }
@@ -373,7 +398,7 @@ class WorldTracker {
             }
             
             // Make wrist/elbow trackers face outward
-            if steamVrIdx == 26 || steamVrIdx == 27 {
+            if steamVrIdx == 26 {
                 if hand.chirality == .right {
                     orientation = orientation * WorldTracker.rightForearmOrientationCorrection
                 }
@@ -381,13 +406,17 @@ class WorldTracker {
                     orientation = orientation * WorldTracker.leftForearmOrientationCorrection
                 }
             }
-
-            // HACK: Apple's elbows currently have the same orientation as their wrists, which VRChat's IK really doesn't like.
-            // Ideally, the elbows would be some lerp based on the wrists, where the mapping goes from the wrist rotation 0-270deg
-            // to the elbow mapping 0-90deg.
+            
             if steamVrIdx == 27 {
-                orientation = simd_quatf(ix: 0.0, iy: 0.0, iz: 0.0, r: 1.0)
+                if hand.chirality == .right {
+                    orientation = orientation * WorldTracker.rightWristOrientationCorrectionA
+                }
+                else {
+                    orientation = orientation * WorldTracker.leftWristOrientationCorrectionA
+                }
             }
+
+            
 
             var position = transform.columns.3
             // Move wrist/elbow slightly outward so that they appear to be on the surface of the arm,
